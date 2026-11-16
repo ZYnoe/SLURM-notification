@@ -228,3 +228,48 @@ fn starts_and_stops_in_the_background() {
     let status = fixture.command("status").output().unwrap();
     assert!(String::from_utf8_lossy(&status.stdout).contains("not running"));
 }
+
+#[test]
+fn background_monitor_prunes_expired_logs() {
+    let fixture = Fixture::new();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let day = 24 * 60 * 60;
+    fs::write(
+        &fixture.log,
+        format!(
+            "[slurm-notify {}] expired entry\n\
+             [slurm-notify {}] retained entry\n",
+            now - 4 * day,
+            now - day
+        ),
+    )
+    .unwrap();
+
+    let start = fixture.command("start").output().unwrap();
+    assert!(
+        start.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    let mut pruned = false;
+    for _ in 0..40 {
+        let log = fs::read_to_string(&fixture.log).unwrap_or_default();
+        if !log.contains("expired entry") && log.contains("retained entry") {
+            pruned = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(pruned, "background monitor did not prune expired log entry");
+
+    let stop = fixture.command("stop").output().unwrap();
+    assert!(
+        stop.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}

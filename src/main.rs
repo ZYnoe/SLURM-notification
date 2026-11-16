@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -25,6 +25,8 @@ const TERMINAL_STATES: &[&str] = &[
 const SACCT_FORMAT: &str =
     "JobID,State,ExitCode,Elapsed,End,Partition,NodeList,JobName%120";
 const MAX_SLACK_TEXT_CHARS: usize = 3500;
+const LOG_RETENTION_SECS: u64 = 3 * 24 * 60 * 60;
+const LOG_PRUNE_INTERVAL_SECS: u64 = 60 * 60;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -246,7 +248,7 @@ impl MonitorState {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("error: {error}");
+        log(&format!("error: {error}"));
         std::process::exit(1);
     }
 }
@@ -361,7 +363,20 @@ fn monitor(config: &Config, once: bool) -> Result<(), String> {
         establish_baseline(config, &mut state)?;
     }
 
+    let mut next_log_prune = unix_now();
     loop {
+        let now = unix_now();
+        if !once && now >= next_log_prune {
+            match prune_monitor_log(&config.log_file, now) {
+                Ok(0) => {}
+                Ok(lines) => log(&format!(
+                    "removed {lines} log line(s) older than {} days",
+                    LOG_RETENTION_SECS / (24 * 60 * 60)
+                )),
+                Err(error) => log(&format!("log cleanup failed: {error}")),
+            }
+            next_log_prune = now.saturating_add(LOG_PRUNE_INTERVAL_SECS);
+        }
         if let Err(error) = poll_once(config, &mut state, webhook.as_deref()) {
             log(&format!("poll failed: {error}"));
         }
@@ -1073,6 +1088,56 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
+fn log_entry_timestamp(line: &str) -> Option<u64> {
+    let rest = line.strip_prefix("[slurm-notify ")?;
+    let end = rest.find(']')?;
+    rest[..end].parse().ok()
+}
+
+fn prune_monitor_log(path: &Path, now: u64) -> Result<usize, String> {
+    let contents = match fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => {
+            return Err(format!(
+                "cannot read log file {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    let cutoff = now.saturating_sub(LOG_RETENTION_SECS);
+    let mut retained = String::with_capacity(contents.len());
+    let mut current_entry_timestamp = None;
+    let mut removed_lines = 0;
+
+    for line in contents.split_inclusive('\n') {
+        if let Some(timestamp) = log_entry_timestamp(line) {
+            current_entry_timestamp = Some(timestamp);
+        }
+        let keep = current_entry_timestamp.map_or(true, |timestamp| timestamp >= cutoff);
+        if keep {
+            retained.push_str(line);
+        } else {
+            removed_lines += 1;
+        }
+    }
+
+    if removed_lines == 0 {
+        return Ok(0);
+    }
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|error| format!("cannot open log file {}: {error}", path.display()))?;
+    file.seek(SeekFrom::Start(0))
+        .and_then(|_| file.write_all(retained.as_bytes()))
+        .and_then(|_| file.set_len(retained.len() as u64))
+        .and_then(|_| file.sync_data())
+        .map_err(|error| format!("cannot rewrite log file {}: {error}", path.display()))?;
+    Ok(removed_lines)
+}
+
 fn log(message: &str) {
     eprintln!("[slurm-notify {}] {}", unix_now(), message);
 }
@@ -1096,7 +1161,7 @@ Options:
   --lookback-hours HOURS    sacct history window (default: 6)
   --state-file PATH         State file for deduplication
   --pid-file PATH           Background process PID file
-  --log-file PATH           Background monitor log file
+  --log-file PATH           Background monitor log (3-day retention)
   --env-file PATH           File containing SLACK_WEBHOOK_URL
   --dry-run                 Print Slack payloads without sending them
   -h, --help                Show this help
@@ -1164,5 +1229,39 @@ mod tests {
         assert!(messages
             .iter()
             .all(|message| message.chars().count() <= MAX_SLACK_TEXT_CHARS + 100));
+    }
+
+    #[test]
+    fn prunes_log_entries_older_than_three_days() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "slurm-notify-log-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("monitor.log");
+        let now = 10 * 24 * 60 * 60;
+        let old = now - 4 * 24 * 60 * 60;
+        let recent = now - 2 * 24 * 60 * 60;
+        fs::write(
+            &path,
+            format!(
+                "[slurm-notify {old}] old entry\ncontinued detail\n\
+                 [slurm-notify {recent}] recent entry\nrecent detail\n"
+            ),
+        )
+        .unwrap();
+
+        let removed = prune_monitor_log(&path, now).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert_eq!(removed, 2);
+        assert!(!contents.contains("old entry"));
+        assert!(!contents.contains("continued detail"));
+        assert!(contents.contains("recent entry"));
+        assert!(contents.contains("recent detail"));
+        let _ = fs::remove_dir_all(root);
     }
 }

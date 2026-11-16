@@ -16,6 +16,7 @@ notification when they finish.
 - Deduplicates notifications using a persistent local state file.
 - Retries Slack delivery when a request fails.
 - Can run in the background after the terminal or SSH session closes.
+- Automatically removes monitor log entries older than three days.
 - Has no third-party Rust dependencies.
 
 ## Requirements
@@ -100,7 +101,8 @@ tail -f ~/.local/state/slurm-notify/monitor.log
 ```
 
 The monitor writes every poll and every delivery attempt to this log instead
-of printing continuously to the terminal.
+of printing continuously to the terminal. It removes log entries older than
+three days and checks for expired entries once per hour.
 
 ### Stop monitoring
 
@@ -140,7 +142,7 @@ This is useful for running the monitor under `tmux`, supervisor, or a
 | `--lookback-hours HOURS` | `6` | `sacct` history window |
 | `--state-file PATH` | `~/.local/state/slurm-notify/state.tsv` | Deduplication state |
 | `--pid-file PATH` | `~/.local/state/slurm-notify/monitor.pid` | Background process PID |
-| `--log-file PATH` | `~/.local/state/slurm-notify/monitor.log` | Background log |
+| `--log-file PATH` | `~/.local/state/slurm-notify/monitor.log` | Background log (3-day retention) |
 | `--env-file PATH` | `~/.config/slurm-notify/slack.env` | Webhook configuration |
 | `--dry-run` | Disabled | Print messages without sending them |
 
@@ -170,7 +172,7 @@ notified normally.
 | File | Purpose |
 | --- | --- |
 | `~/.local/state/slurm-notify/state.tsv` | Job state and deduplication |
-| `~/.local/state/slurm-notify/monitor.log` | Monitor log |
+| `~/.local/state/slurm-notify/monitor.log` | Monitor log, retained for three days |
 | `~/.local/state/slurm-notify/monitor.pid` | Background process ID |
 | `~/.config/slurm-notify/slack.env` | Private Slack webhook configuration |
 
@@ -230,8 +232,8 @@ cargo test --locked
 ```
 
 The test suite covers Slurm output parsing, Slack payload construction,
-notification deduplication, short jobs, long-running jobs, and background
-start/stop management.
+notification deduplication, log retention, short jobs, long-running jobs, and
+background start/stop management.
 
 ## License
 
