@@ -31,7 +31,7 @@ notification when they finish.
 ## Build
 
 ```bash
-git clone https://github.com/YOUR_GITHUB_USERNAME/SLURM-notification.git
+git clone https://github.com/ZYnoe/SLURM-notification.git
 cd SLURM-notification
 cargo build --release
 ```
