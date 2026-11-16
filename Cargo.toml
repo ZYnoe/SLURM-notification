@@ -1,0 +1,13 @@
+[package]
+name = "slurm-notify"
+version = "0.1.0"
+edition = "2021"
+description = "Monitor Slurm jobs and send completion notifications to Slack"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
