@@ -13,6 +13,9 @@ notification when they finish.
 - Detects both running jobs and short jobs that finish between polls.
 - Sends success and failure details, including exit code, elapsed time,
   partition, nodes, and end time.
+- Reports a job array once, as a single summary, after all of its tasks
+  have finished.
+- Reports the final result of requeued jobs (for example after preemption).
 - Deduplicates notifications using a persistent local state file.
 - Retries Slack delivery when a request fails.
 - Can run in the background after the terminal or SSH session closes.
@@ -161,7 +164,19 @@ Example with a 15-second interval:
    long-running jobs are detected even after they are no longer in the
    configured `sacct` lookback window.
 4. Finished job IDs are stored in the state file and are not notified twice.
+   Each Slack message is marked as delivered on its own, so a failure part
+   way through a batch does not resend the messages that already went out.
 5. Finished jobs are grouped into one Slack message per poll when possible.
+6. Array tasks (`123_4`) are held until no task of the same array is pending
+   or running, then sent as one summary with per-state counts and the tasks
+   that did not complete. `squeue --array` lists pending tasks individually;
+   pending ranges such as `123_[5-9]` reported by `sacct` are ignored.
+7. If a job that was already reported appears in `squeue` again as pending or
+   running, it was requeued. The earlier result is discarded and the outcome
+   of the new attempt is reported. While `squeue` shows a job as pending or
+   running, finished `sacct` rows for it are treated as stale.
+8. Unfinished jobs that neither `squeue` nor `sacct` has reported for 7 days
+   are dropped from the state file, with a log entry.
 
 On first start, jobs completed during the lookback window are treated as a
 baseline and are not sent. Jobs that finish after the monitor starts are
@@ -190,6 +205,19 @@ that is intended for persistent user services.
 Only one lightweight instance should monitor a given user and state file.
 Check the cluster policy before leaving long-running processes on a login
 node.
+
+### Clusters with several login nodes
+
+The PID file records the host the monitor was started on. When `status`,
+`start`, or `stop` runs on a different login node that shares the same home
+directory, the process cannot be checked directly, so the state file, which
+the monitor rewrites on every poll, is used as a heartbeat:
+
+- If the state file changed within three poll intervals plus three minutes,
+  the monitor is reported as running on the other host. `start` refuses to
+  launch a second copy and `stop` tells you which host to log in to.
+- If it has not changed for longer than that, the other monitor is treated
+  as gone (for example after a reboot) and `start` launches a new one here.
 
 ## Troubleshooting
 
@@ -232,8 +260,9 @@ cargo test --locked
 ```
 
 The test suite covers Slurm output parsing, Slack payload construction,
-notification deduplication, log retention, short jobs, long-running jobs, and
-background start/stop management.
+notification deduplication, log retention, short jobs, long-running jobs,
+job arrays, requeued jobs, partial Slack failures, monitors on another login
+node, and background start/stop management.
 
 ## License
 

@@ -20,6 +20,7 @@ struct Fixture {
     curl_count: PathBuf,
     curl_config: PathBuf,
     curl_body: PathBuf,
+    curl_all: PathBuf,
 }
 
 impl Fixture {
@@ -54,8 +55,17 @@ impl Fixture {
             &bin.join("curl"),
             "#!/bin/sh\n\
              cat > \"$FAKE_CURL_CONFIG\"\n\
+             sent=$(cat \"$FAKE_CURL_COUNT\" 2>/dev/null | wc -c)\n\
+             if [ -n \"$FAKE_CURL_FAIL_FROM\" ] && [ \"$sent\" -ge \"$FAKE_CURL_FAIL_FROM\" ]; then\n\
+               echo 'curl: (22) simulated failure' >&2\n\
+               exit 22\n\
+             fi\n\
              payload=$(sed -n 's/^data-binary = \"@\\(.*\\)\"$/\\1/p' \"$FAKE_CURL_CONFIG\")\n\
-             if [ -n \"$payload\" ]; then cp \"$payload\" \"$FAKE_CURL_BODY\"; fi\n\
+             if [ -n \"$payload\" ]; then\n\
+               cp \"$payload\" \"$FAKE_CURL_BODY\"\n\
+               cat \"$payload\" >> \"$FAKE_CURL_ALL\"\n\
+               echo >> \"$FAKE_CURL_ALL\"\n\
+             fi\n\
              printf x >> \"$FAKE_CURL_COUNT\"\n",
         );
 
@@ -70,6 +80,7 @@ impl Fixture {
             curl_count: root.join("curl-count"),
             curl_config: root.join("curl-config"),
             curl_body: root.join("curl-body"),
+            curl_all: root.join("curl-all"),
             root,
             bin,
         };
@@ -79,7 +90,7 @@ impl Fixture {
         )
         .unwrap();
         fs::set_permissions(&fixture.env_file, fs::Permissions::from_mode(0o600)).unwrap();
-        fs::write(&fixture.squeue, "200\n").unwrap();
+        fs::write(&fixture.squeue, "200|RUNNING\n").unwrap();
         fs::write(
             &fixture.sacct_recent,
             "100|COMPLETED|0:0|00:00:10|2026-11-16T12:00:00|amd|n001|old-job\n",
@@ -116,11 +127,31 @@ impl Fixture {
             .env("FAKE_CURL_COUNT", &self.curl_count)
             .env("FAKE_CURL_CONFIG", &self.curl_config)
             .env("FAKE_CURL_BODY", &self.curl_body)
+            .env("FAKE_CURL_ALL", &self.curl_all)
             .env(
                 "SLACK_WEBHOOK_URL",
                 "https://hooks.slack.com/services/test/test/test",
             );
         command
+    }
+
+    fn run_ok(&self, label: &str) {
+        let output = self.run_once(false);
+        assert!(
+            output.status.success(),
+            "{label} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn set_slurm(&self, squeue: &str, sacct_recent: &str, sacct_jobs: &str) {
+        fs::write(&self.squeue, squeue).unwrap();
+        fs::write(&self.sacct_recent, sacct_recent).unwrap();
+        fs::write(&self.sacct_jobs, sacct_jobs).unwrap();
+    }
+
+    fn body(&self) -> String {
+        fs::read_to_string(&self.curl_body).unwrap_or_default()
     }
 
     fn curl_count(&self) -> usize {
@@ -266,6 +297,170 @@ fn background_monitor_prunes_expired_logs() {
     }
     assert!(pruned, "background monitor did not prune expired log entry");
 
+    let stop = fixture.command("stop").output().unwrap();
+    assert!(
+        stop.status.success(),
+        "stop failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+}
+
+fn row(id: &str, state: &str, exit: &str, name: &str) -> String {
+    format!("{id}|{state}|{exit}|00:10:00|2026-11-16T12:00:00|amd|n001|{name}\n")
+}
+
+#[test]
+fn array_tasks_are_sent_together_once_the_array_finishes() {
+    let fixture = Fixture::new();
+    fixture.set_slurm("", &row("100", "COMPLETED", "0:0", "old-job"), "");
+    fixture.run_ok("baseline");
+
+    // Task 0 is already done, the others are still running or pending.
+    // sacct also reports the pending range, which must be ignored.
+    fixture.set_slurm(
+        "300_1|RUNNING\n300_2|PENDING\n300_3|PENDING\n",
+        &format!(
+            "{}{}",
+            row("300_0", "COMPLETED", "0:0", "arr"),
+            row("300_[2-3]", "PENDING", "0:0", "arr")
+        ),
+        "",
+    );
+    fixture.run_ok("partial array");
+    assert_eq!(fixture.curl_count(), 0, "array was reported before it finished");
+
+    let done = format!(
+        "{}{}{}{}",
+        row("300_0", "COMPLETED", "0:0", "arr"),
+        row("300_1", "COMPLETED", "0:0", "arr"),
+        row("300_2", "FAILED", "1:0", "arr"),
+        row("300_3", "COMPLETED", "0:0", "arr")
+    );
+    fixture.set_slurm("", &done, &done);
+    fixture.run_ok("finished array");
+    assert_eq!(fixture.curl_count(), 1);
+    let body = fixture.body();
+    assert!(body.contains("*Array 300*"), "{body}");
+    assert!(body.contains("COMPLETED ×3, FAILED ×1"), "{body}");
+    assert!(body.contains("`300_2` FAILED"), "{body}");
+
+    let state = fs::read_to_string(&fixture.state).unwrap();
+    assert!(!state.contains('['), "array range stored in state:\n{state}");
+
+    fixture.run_ok("dedup");
+    assert_eq!(fixture.curl_count(), 1);
+}
+
+#[test]
+fn requeued_job_reports_its_final_result() {
+    let fixture = Fixture::new();
+    fixture.set_slurm("400|RUNNING\n", "", "");
+    fixture.run_ok("baseline");
+
+    fixture.set_slurm("", "", &row("400", "PREEMPTED", "0:0", "req-job"));
+    fixture.run_ok("preempted");
+    assert_eq!(fixture.curl_count(), 1);
+    assert!(fixture.body().contains("PREEMPTED"));
+
+    // Requeued: squeue shows it again while sacct still has the old row.
+    let stale = row("400", "PREEMPTED", "0:0", "req-job");
+    fixture.set_slurm("400|PENDING\n", &stale, "");
+    fixture.run_ok("requeued pending");
+    fixture.set_slurm("400|RUNNING\n", &stale, "");
+    fixture.run_ok("requeued running");
+    assert_eq!(fixture.curl_count(), 1, "stale PREEMPTED row was sent again");
+
+    let done = row("400", "COMPLETED", "0:0", "req-job");
+    fixture.set_slurm("", &done, &done);
+    fixture.run_ok("completed");
+    assert_eq!(fixture.curl_count(), 2);
+    assert!(fixture.body().contains("COMPLETED"));
+
+    // A job that lingers in COMPLETING must not trigger the requeue path.
+    fixture.set_slurm("400|COMPLETING\n", &done, &done);
+    fixture.run_ok("completing");
+    assert_eq!(fixture.curl_count(), 2);
+}
+
+#[test]
+fn finishing_while_squeue_still_shows_running_is_reported_next_poll() {
+    let fixture = Fixture::new();
+    fixture.set_slurm("500|RUNNING\n", "", "");
+    fixture.run_ok("baseline");
+
+    // The job ends between the squeue and sacct calls of one poll.
+    let done = row("500", "COMPLETED", "0:0", "race-job");
+    fixture.set_slurm("500|RUNNING\n", &done, "");
+    fixture.run_ok("race");
+    assert_eq!(fixture.curl_count(), 0);
+
+    fixture.set_slurm("", &done, &done);
+    fixture.run_ok("next poll");
+    assert_eq!(fixture.curl_count(), 1);
+    fixture.run_ok("dedup");
+    assert_eq!(fixture.curl_count(), 1);
+}
+
+#[test]
+fn partial_slack_failure_does_not_resend_delivered_messages() {
+    let fixture = Fixture::new();
+    fixture.set_slurm("", "", "");
+    fixture.run_ok("baseline");
+
+    let name = "a-long-job-name-for-message-splitting".repeat(3);
+    let rows: String = (600..640)
+        .map(|id| row(&id.to_string(), "COMPLETED", "0:0", &name))
+        .collect();
+    fixture.set_slurm("", &rows, "");
+
+    let first = fixture.command("once").env("FAKE_CURL_FAIL_FROM", "1").output().unwrap();
+    assert!(first.status.success());
+    assert_eq!(fixture.curl_count(), 1, "only the first message should succeed");
+
+    fixture.run_ok("retry");
+    fixture.run_ok("dedup");
+    let all = fs::read_to_string(&fixture.curl_all).unwrap();
+    for id in 600..640 {
+        let marker = format!("*Job {id}*");
+        assert_eq!(all.matches(&marker).count(), 1, "{marker} not sent exactly once");
+    }
+}
+
+#[test]
+fn respects_a_monitor_running_on_another_login_node() {
+    let fixture = Fixture::new();
+    fixture.run_ok("create state");
+    fs::write(&fixture.pid, "999999\nsome-other-login-node\n30\n").unwrap();
+
+    let status = fixture.command("status").output().unwrap();
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(stdout.contains("some-other-login-node"), "{stdout}");
+
+    let start = fixture.command("start").output().unwrap();
+    assert!(!start.status.success(), "second monitor started on another host");
+    assert!(String::from_utf8_lossy(&start.stderr).contains("some-other-login-node"));
+    let stop = fixture.command("stop").output().unwrap();
+    assert!(!stop.status.success());
+    assert!(fixture.pid.exists(), "PID file of the other host was removed");
+
+    // Once the shared state file stops changing, the old monitor is treated as gone.
+    let touched = Command::new("touch")
+        .args(["-d", "1 hour ago"])
+        .arg(&fixture.state)
+        .status()
+        .unwrap();
+    assert!(touched.success());
+    let status = fixture.command("status").output().unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).contains("not running"));
+
+    let start = fixture.command("start").output().unwrap();
+    assert!(
+        start.status.success(),
+        "start after stale heartbeat failed: {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+    let pid_file = fs::read_to_string(&fixture.pid).unwrap();
+    assert_eq!(pid_file.lines().count(), 3, "{pid_file}");
     let stop = fixture.command("stop").output().unwrap();
     assert!(
         stop.status.success(),
