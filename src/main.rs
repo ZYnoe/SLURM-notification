@@ -27,6 +27,14 @@ const SACCT_FORMAT: &str =
 const MAX_SLACK_TEXT_CHARS: usize = 3500;
 const LOG_RETENTION_SECS: u64 = 3 * 24 * 60 * 60;
 const LOG_PRUNE_INTERVAL_SECS: u64 = 60 * 60;
+const FINISHED_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
+/// Unfinished jobs that neither squeue nor sacct has reported for this long
+/// are dropped so that they are not queried forever.
+const UNFINISHED_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+/// Extra time, on top of three poll intervals, before a monitor on another
+/// login node is considered gone because the shared state file stopped changing.
+const HEARTBEAT_GRACE_SECS: u64 = 180;
+const MAX_LISTED_ARRAY_PROBLEMS: usize = 10;
 
 #[derive(Clone, Debug)]
 struct Config {
@@ -236,13 +244,27 @@ impl MonitorState {
         })
     }
 
-    fn prune(&mut self, now: u64) {
-        const RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
-        self.jobs.retain(|_, record| {
-            !record.notified
-                || !record.terminal
-                || now.saturating_sub(record.last_seen) <= RETENTION_SECS
+    /// Removes old records and returns the IDs of unfinished jobs that were
+    /// dropped because Slurm stopped reporting them.
+    fn prune(&mut self, now: u64) -> Vec<String> {
+        let mut expired = Vec::new();
+        self.jobs.retain(|id, record| {
+            // Pending array ranges such as `123_[4-9]` are not real job IDs and
+            // could never be resolved; older versions stored them.
+            if id.contains('[') {
+                return false;
+            }
+            let age = now.saturating_sub(record.last_seen);
+            if record.terminal {
+                !record.notified || age <= FINISHED_RETENTION_SECS
+            } else if age <= UNFINISHED_RETENTION_SECS {
+                true
+            } else {
+                expired.push(id.clone());
+                false
+            }
         });
+        expired
     }
 }
 
@@ -389,10 +411,10 @@ fn monitor(config: &Config, once: bool) -> Result<(), String> {
 
 fn establish_baseline(config: &Config, state: &mut MonitorState) -> Result<(), String> {
     let now = unix_now();
-    let active = match squeue_ids(config) {
-        Ok(ids) => {
-            log(&format!("baseline: {} active jobs", ids.len()));
-            ids
+    let active = match squeue_jobs(config) {
+        Ok(jobs) => {
+            log(&format!("baseline: {} active jobs", jobs.len()));
+            jobs.into_keys().collect::<BTreeSet<_>>()
         }
         Err(error) => {
             log(&format!(
@@ -418,7 +440,7 @@ fn establish_baseline(config: &Config, state: &mut MonitorState) -> Result<(), S
         state.jobs.insert(record.id.clone(), record);
     }
     state.initialized = true;
-    state.prune(now);
+    log_expired(&state.prune(now));
     state.save(&config.state_file)?;
     log("baseline saved; notifications are active for new job completions");
     Ok(())
@@ -428,21 +450,33 @@ fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -
     let now = unix_now();
     let mut errors = Vec::new();
 
-    let active = match squeue_ids(config) {
-        Ok(ids) => ids,
+    // Job ID -> squeue state. When squeue fails, fall back to the jobs that
+    // were unfinished last time, with an unknown state.
+    let active: BTreeMap<String, String> = match squeue_jobs(config) {
+        Ok(jobs) => jobs,
         Err(error) => {
             errors.push(format!("squeue: {error}"));
             state
                 .jobs
                 .values()
                 .filter(|record| !record.terminal)
-                .map(|record| record.id.clone())
+                .map(|record| (record.id.clone(), String::new()))
                 .collect()
         }
     };
-    for id in &active {
+    for (id, squeue_state) in &active {
         let record = state.jobs.entry(id.clone()).or_default();
         record.id = id.clone();
+        if record.terminal && is_running_like(squeue_state) {
+            // A requeued job keeps its ID. Forget the earlier result so the
+            // outcome of the new attempt is reported.
+            log(&format!(
+                "job {id} is {squeue_state} again after {}; waiting for the new result",
+                record.state
+            ));
+            record.terminal = false;
+            record.notified = false;
+        }
         record.mark_running(now);
     }
 
@@ -459,7 +493,7 @@ fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -
     let vanished: Vec<String> = state
         .jobs
         .values()
-        .filter(|record| !record.terminal && !active.contains(&record.id))
+        .filter(|record| !record.terminal && !active.contains_key(&record.id))
         .map(|record| record.id.clone())
         .collect();
     for chunk in vanished.chunks(100) {
@@ -475,6 +509,15 @@ fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -
 
     for record in accounting_records.into_values() {
         if record.terminal {
+            if active
+                .get(&record.id)
+                .map_or(false, |squeue_state| is_running_like(squeue_state))
+            {
+                // squeue still shows the job pending or running, so this
+                // accounting row belongs to an earlier attempt or is ahead of
+                // squeue. The job is checked again once squeue drops it.
+                continue;
+            }
             match state.jobs.get_mut(&record.id) {
                 Some(existing) if existing.notified => {
                     existing.last_seen = now;
@@ -494,49 +537,71 @@ fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -
         }
     }
 
-    state.prune(now);
+    log_expired(&state.prune(now));
     state.save(&config.state_file)?;
 
+    // Array tasks are reported together once every task of the array is done.
+    let unfinished_arrays: BTreeSet<String> = state
+        .jobs
+        .values()
+        .filter(|record| !record.terminal)
+        .filter_map(|record| array_parent(&record.id).map(ToOwned::to_owned))
+        .collect();
+    let mut held = 0;
     let pending: Vec<JobRecord> = state
         .jobs
         .values()
         .filter(|record| record.terminal && !record.notified)
+        .filter(|record| {
+            let hold = array_parent(&record.id)
+                .map_or(false, |parent| unfinished_arrays.contains(parent));
+            if hold {
+                held += 1;
+            }
+            !hold
+        })
         .cloned()
         .collect();
     if !pending.is_empty() {
+        let batches = build_slack_messages(&config.user, &pending);
         if let Some(webhook) = webhook {
-            let messages = build_slack_messages(&config.user, &pending);
-            let mut sent = true;
-            for message in &messages {
-                match send_slack(webhook, message) {
-                    Ok(()) => log(&format!(
-                        "sent Slack notification for {} job(s)",
-                        pending.len()
-                    )),
+            for batch in &batches {
+                match send_slack(webhook, &batch.text) {
+                    Ok(()) => {
+                        // Mark each delivered message right away so that a
+                        // later failure does not resend it.
+                        for id in &batch.job_ids {
+                            if let Some(saved) = state.jobs.get_mut(id) {
+                                saved.notified = true;
+                            }
+                        }
+                        state.save(&config.state_file)?;
+                        log(&format!(
+                            "sent Slack notification for {} job(s)",
+                            batch.job_ids.len()
+                        ));
+                    }
                     Err(error) => {
-                        sent = false;
                         errors.push(format!("Slack: {error}"));
+                        break;
                     }
                 }
-            }
-            if sent {
-                for record in &pending {
-                    if let Some(saved) = state.jobs.get_mut(&record.id) {
-                        saved.notified = true;
-                    }
-                }
-                state.save(&config.state_file)?;
             }
         } else {
-            for message in build_slack_messages(&config.user, &pending) {
-                log(&format!("dry-run Slack payload:\n{message}"));
+            for batch in batches {
+                log(&format!("dry-run Slack payload:\n{}", batch.text));
             }
         }
     }
 
     if errors.is_empty() {
+        let held_note = if held > 0 {
+            format!(", {held} array task(s) waiting for the rest of their array")
+        } else {
+            String::new()
+        };
         log(&format!(
-            "poll complete: {} active, {} awaiting notification",
+            "poll complete: {} active, {} awaiting notification{held_note}",
             active.len(),
             pending.len()
         ));
@@ -546,19 +611,39 @@ fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -
     }
 }
 
-fn squeue_ids(config: &Config) -> Result<BTreeSet<String>, String> {
+/// Returns active job IDs with their squeue state. `--array` lists every
+/// pending array task on its own line instead of a range like `123_[4-9]`.
+fn squeue_jobs(config: &Config) -> Result<BTreeMap<String, String>, String> {
     let output = run_with_timeout(
         "squeue",
-        &["--noheader", "--user", &config.user, "--format=%i"],
+        &[
+            "--noheader",
+            "--array",
+            "--user",
+            &config.user,
+            "--format=%i|%T",
+        ],
     )?;
     ensure_success("squeue", &output)?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
+    Ok(parse_squeue_output(&stdout))
+}
+
+fn parse_squeue_output(stdout: &str) -> BTreeMap<String, String> {
+    stdout
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
+        .filter_map(|line| {
+            let (id, state) = line.split_once('|').unwrap_or((line, ""));
+            let id = id.trim();
+            if id.is_empty() || id.contains('[') {
+                None
+            } else {
+                Some((id.to_string(), state.trim().to_string()))
+            }
+        })
+        .collect()
 }
 
 fn sacct_recent(config: &Config) -> Result<Vec<JobRecord>, String> {
@@ -609,7 +694,11 @@ fn parse_sacct_output(command: &str, output: &Output) -> Result<Vec<JobRecord>, 
     let mut records = Vec::new();
     for line in stdout.lines() {
         if let Some(record) = JobRecord::from_accounting(line, now) {
-            records.push(record);
+            // Rows such as `123_[4-9]` stand for array tasks that have not
+            // started; each task is tracked individually through squeue.
+            if !record.id.contains('[') {
+                records.push(record);
+            }
         } else if !line.trim().is_empty() {
             log(&format!("ignored malformed sacct row: {line}"));
         }
@@ -770,26 +859,63 @@ fn curl_config_escape(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn build_slack_messages(user: &str, jobs: &[JobRecord]) -> Vec<String> {
-    let mut messages = Vec::new();
-    let mut body = String::new();
+#[derive(Clone, Debug)]
+struct SlackBatch {
+    text: String,
+    job_ids: Vec<String>,
+}
+
+fn build_slack_messages(user: &str, jobs: &[JobRecord]) -> Vec<SlackBatch> {
+    let mut arrays: BTreeMap<&str, Vec<&JobRecord>> = BTreeMap::new();
     for job in jobs {
-        let entry = format_job(job);
+        if let Some(parent) = array_parent(&job.id) {
+            arrays.entry(parent).or_default().push(job);
+        }
+    }
+
+    let mut entries: Vec<(String, Vec<String>)> = Vec::new();
+    let mut emitted = BTreeSet::new();
+    for job in jobs {
+        match array_parent(&job.id) {
+            Some(parent) if arrays[parent].len() > 1 => {
+                if emitted.insert(parent) {
+                    let tasks = &arrays[parent];
+                    entries.push((
+                        format_array(parent, tasks),
+                        tasks.iter().map(|task| task.id.clone()).collect(),
+                    ));
+                }
+            }
+            _ => entries.push((format_job(job), vec![job.id.clone()])),
+        }
+    }
+
+    let mut batches = Vec::new();
+    let mut body = String::new();
+    let mut job_ids = Vec::new();
+    for (entry, entry_ids) in entries {
         if !body.is_empty()
             && body.chars().count() + entry.chars().count() + 80 > MAX_SLACK_TEXT_CHARS
         {
-            messages.push(slack_message(user, &body));
+            batches.push(SlackBatch {
+                text: slack_message(user, &body),
+                job_ids: std::mem::take(&mut job_ids),
+            });
             body.clear();
         }
         if !body.is_empty() {
             body.push_str("\n\n");
         }
         body.push_str(&entry);
+        job_ids.extend(entry_ids);
     }
     if !body.is_empty() {
-        messages.push(slack_message(user, &body));
+        batches.push(SlackBatch {
+            text: slack_message(user, &body),
+            job_ids,
+        });
     }
-    messages
+    batches
 }
 
 fn slack_message(user: &str, body: &str) -> String {
@@ -832,6 +958,79 @@ fn format_job(job: &JobRecord) -> String {
     lines.join("\n")
 }
 
+fn format_array(parent: &str, tasks: &[&JobRecord]) -> String {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for task in tasks {
+        *counts.entry(base_state(&task.state)).or_default() += 1;
+    }
+    let icon = if counts.keys().all(|state| state == "COMPLETED") {
+        ":white_check_mark:"
+    } else if counts
+        .keys()
+        .all(|state| state == "COMPLETED" || state == "CANCELLED")
+    {
+        ":warning:"
+    } else {
+        ":x:"
+    };
+    let name = tasks
+        .iter()
+        .find(|task| !task.name.is_empty())
+        .map(|task| task.name.replace('`', "'"))
+        .unwrap_or_else(|| "(unknown)".to_string());
+    let summary = counts
+        .iter()
+        .map(|(state, count)| format!("{state} ×{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut lines = vec![
+        format!("{icon} *Array {parent}* `{name}`"),
+        format!("任务数: `{}`", tasks.len()),
+        format!("状态: *{summary}*"),
+    ];
+
+    let problems: Vec<&&JobRecord> = tasks
+        .iter()
+        .filter(|task| base_state(&task.state) != "COMPLETED")
+        .collect();
+    if !problems.is_empty() {
+        lines.push("未成功的任务:".to_string());
+        for task in problems.iter().take(MAX_LISTED_ARRAY_PROBLEMS) {
+            let exit = if task.exit_code.is_empty() {
+                String::new()
+            } else {
+                format!(" 退出码 `{}`", task.exit_code)
+            };
+            lines.push(format!("• `{}` {}{exit}", task.id, task.state));
+        }
+        if problems.len() > MAX_LISTED_ARRAY_PROBLEMS {
+            lines.push(format!(
+                "• …另有 {} 个",
+                problems.len() - MAX_LISTED_ARRAY_PROBLEMS
+            ));
+        }
+    }
+
+    let partitions: BTreeSet<&str> = tasks
+        .iter()
+        .map(|task| task.partition.as_str())
+        .filter(|partition| !partition.is_empty())
+        .collect();
+    if partitions.len() == 1 {
+        lines.push(format!("分区: `{}`", partitions.iter().next().unwrap()));
+    }
+    if let Some(end) = tasks
+        .iter()
+        .map(|task| task.end.as_str())
+        .filter(|end| !end.is_empty() && *end != "Unknown")
+        .max()
+    {
+        lines.push(format!("最后结束时间: `{end}`"));
+    }
+    lines.join("\n")
+}
+
 fn json_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
@@ -860,11 +1059,31 @@ fn test_slack(config: &Config) -> Result<(), String> {
 }
 
 fn start(config: &Config) -> Result<(), String> {
-    if let Some(pid) = read_live_pid(&config.pid_file) {
-        return Err(format!(
-            "monitor is already running with PID {pid}; see {}",
-            config.log_file.display()
-        ));
+    match locate_monitor(config) {
+        MonitorLocation::Local(pid) => {
+            return Err(format!(
+                "monitor is already running with PID {pid}; see {}",
+                config.log_file.display()
+            ));
+        }
+        MonitorLocation::Remote {
+            pid,
+            host,
+            heartbeat_age,
+        } => {
+            return Err(format!(
+                "monitor is already running on {host} (PID {pid}, last poll {heartbeat_age}s ago); \
+                 log in to {host} to stop it, or wait until it has been silent for a few minutes"
+            ));
+        }
+        MonitorLocation::StaleRemote { host, heartbeat_age } => {
+            println!(
+                "Previous monitor on {host} has not polled for {}; starting a new one here.",
+                describe_age(heartbeat_age)
+            );
+            let _ = fs::remove_file(&config.pid_file);
+        }
+        MonitorLocation::NotRunning => {}
     }
     // Validate the webhook before leaving a broken process in the background.
     if !config.dry_run {
@@ -909,7 +1128,13 @@ fn start(config: &Config) -> Result<(), String> {
     let child = command
         .spawn()
         .map_err(|error| format!("cannot start background monitor: {error}"))?;
-    if let Err(error) = fs::write(&config.pid_file, format!("{}\n", child.id())) {
+    let pid_content = format!(
+        "{}\n{}\n{}\n",
+        child.id(),
+        current_hostname(),
+        config.interval_secs
+    );
+    if let Err(error) = fs::write(&config.pid_file, pid_content) {
         let _ = Command::new("kill")
             .arg("-TERM")
             .arg(child.id().to_string())
@@ -929,9 +1154,17 @@ fn start(config: &Config) -> Result<(), String> {
 }
 
 fn stop(config: &Config) -> Result<(), String> {
-    let Some(pid) = read_live_pid(&config.pid_file) else {
-        println!("Monitor is not running.");
-        return Ok(());
+    let pid = match locate_monitor(config) {
+        MonitorLocation::Local(pid) => pid,
+        MonitorLocation::Remote { pid, host, .. } => {
+            return Err(format!(
+                "monitor runs on {host} (PID {pid}); log in to {host} and run stop there"
+            ));
+        }
+        MonitorLocation::StaleRemote { .. } | MonitorLocation::NotRunning => {
+            println!("Monitor is not running.");
+            return Ok(());
+        }
     };
 
     let status = Command::new("kill")
@@ -956,18 +1189,30 @@ fn stop(config: &Config) -> Result<(), String> {
 }
 
 fn status(config: &Config) -> Result<(), String> {
-    match read_live_pid(&config.pid_file) {
-        Some(pid) => {
+    match locate_monitor(config) {
+        MonitorLocation::Local(pid) => {
             println!("Monitor is running with PID {pid}.");
             println!("Log: {}", config.log_file.display());
             println!("State: {}", config.state_file.display());
-            Ok(())
         }
-        None => {
-            println!("Monitor is not running.");
-            Ok(())
+        MonitorLocation::Remote {
+            pid,
+            host,
+            heartbeat_age,
+        } => {
+            println!("Monitor is running on another host: {host} (PID {pid}).");
+            println!("Last poll: {heartbeat_age}s ago.");
+            println!("Log: {}", config.log_file.display());
         }
+        MonitorLocation::StaleRemote { host, heartbeat_age } => {
+            println!(
+                "Monitor is not running (last seen on {host}, no poll for {}).",
+                describe_age(heartbeat_age)
+            );
+        }
+        MonitorLocation::NotRunning => println!("Monitor is not running."),
     }
+    Ok(())
 }
 
 fn config_to_args(config: &Config) -> Vec<String> {
@@ -993,28 +1238,119 @@ fn config_to_args(config: &Config) -> Vec<String> {
     args
 }
 
-fn read_live_pid(path: &Path) -> Option<u32> {
-    match read_pid(path) {
-        Ok(Some(pid)) if process_alive(pid) && looks_like_monitor(pid) => Some(pid),
-        Ok(Some(_)) => {
-            let _ = fs::remove_file(path);
-            None
+struct PidInfo {
+    pid: u32,
+    host: Option<String>,
+    interval_secs: Option<u64>,
+}
+
+enum MonitorLocation {
+    NotRunning,
+    Local(u32),
+    /// Started on another login node that shares this home directory. The
+    /// process cannot be checked from here, so the state file, which the
+    /// monitor rewrites on every poll, serves as its heartbeat.
+    Remote {
+        pid: u32,
+        host: String,
+        heartbeat_age: u64,
+    },
+    StaleRemote {
+        host: String,
+        heartbeat_age: Option<u64>,
+    },
+}
+
+fn locate_monitor(config: &Config) -> MonitorLocation {
+    let info = match read_pid(&config.pid_file) {
+        Ok(Some(info)) => info,
+        _ => return MonitorLocation::NotRunning,
+    };
+    if let Some(host) = info.host {
+        if host != current_hostname() {
+            let interval = info.interval_secs.unwrap_or(config.interval_secs);
+            let limit = interval
+                .saturating_mul(3)
+                .saturating_add(HEARTBEAT_GRACE_SECS);
+            let heartbeat_age = file_age_secs(&config.state_file);
+            return match heartbeat_age {
+                Some(age) if age <= limit => MonitorLocation::Remote {
+                    pid: info.pid,
+                    host,
+                    heartbeat_age: age,
+                },
+                _ => MonitorLocation::StaleRemote {
+                    host,
+                    heartbeat_age,
+                },
+            };
         }
-        _ => None,
+    }
+    if process_alive(info.pid) && looks_like_monitor(info.pid) {
+        MonitorLocation::Local(info.pid)
+    } else {
+        let _ = fs::remove_file(&config.pid_file);
+        MonitorLocation::NotRunning
     }
 }
 
-fn read_pid(path: &Path) -> Result<Option<u32>, String> {
+/// Reads `PID`, then optionally `HOSTNAME` and `INTERVAL` on the next lines.
+/// PID files from older versions contain only the PID.
+fn read_pid(path: &Path) -> Result<Option<PidInfo>, String> {
     if !path.exists() {
         return Ok(None);
     }
     let content = fs::read_to_string(path)
         .map_err(|error| format!("cannot read PID file {}: {error}", path.display()))?;
-    let pid = content
-        .trim()
+    let mut lines = content.lines().map(str::trim);
+    let pid = lines
+        .next()
+        .unwrap_or("")
         .parse::<u32>()
         .map_err(|_| format!("invalid PID in {}", path.display()))?;
-    Ok(Some(pid))
+    let host = lines
+        .next()
+        .filter(|host| !host.is_empty())
+        .map(ToOwned::to_owned);
+    let interval_secs = lines.next().and_then(|value| value.parse().ok());
+    Ok(Some(PidInfo {
+        pid,
+        host,
+        interval_secs,
+    }))
+}
+
+fn file_age_secs(path: &Path) -> Option<u64> {
+    let modified = fs::metadata(path).ok()?.modified().ok()?;
+    Some(
+        SystemTime::now()
+            .duration_since(modified)
+            .map(|age| age.as_secs())
+            .unwrap_or(0),
+    )
+}
+
+fn describe_age(age: Option<u64>) -> String {
+    match age {
+        Some(age) => format!("{age}s"),
+        None => "an unknown time (state file missing)".to_string(),
+    }
+}
+
+fn current_hostname() -> String {
+    fs::read_to_string("/proc/sys/kernel/hostname")
+        .ok()
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+                .filter(|name| !name.is_empty())
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 fn process_alive(pid: u32) -> bool {
@@ -1072,13 +1408,44 @@ fn clean(value: &str) -> String {
         .collect()
 }
 
-fn is_terminal(state: &str) -> bool {
-    let normalized = state
+/// `CANCELLED by 1000` -> `CANCELLED`, `COMPLETED+` -> `COMPLETED`.
+fn base_state(state: &str) -> String {
+    state
         .split_whitespace()
         .next()
         .unwrap_or("")
-        .trim_end_matches('+');
-    TERMINAL_STATES.contains(&normalized)
+        .trim_end_matches('+')
+        .to_string()
+}
+
+fn is_terminal(state: &str) -> bool {
+    TERMINAL_STATES.contains(&base_state(state).as_str())
+}
+
+/// True when squeue reports the job as waiting or running (as opposed to
+/// finishing up or unknown), which is when a finished accounting row for the
+/// same ID must be stale.
+fn is_running_like(squeue_state: &str) -> bool {
+    let state = base_state(squeue_state);
+    !state.is_empty()
+        && !is_terminal(&state)
+        && !matches!(state.as_str(), "COMPLETING" | "STAGE_OUT" | "SIGNALING")
+}
+
+/// `123_4` -> `123`. Only array tasks contain an underscore.
+fn array_parent(id: &str) -> Option<&str> {
+    id.split_once('_').map(|(parent, _)| parent)
+}
+
+fn log_expired(expired: &[String]) {
+    if !expired.is_empty() {
+        log(&format!(
+            "dropped {} unfinished job(s) not reported by Slurm for {} days: {}",
+            expired.len(),
+            UNFINISHED_RETENTION_SECS / (24 * 60 * 60),
+            expired.join(",")
+        ));
+    }
 }
 
 fn unix_now() -> u64 {
@@ -1228,7 +1595,103 @@ mod tests {
         assert!(messages.len() > 1);
         assert!(messages
             .iter()
-            .all(|message| message.chars().count() <= MAX_SLACK_TEXT_CHARS + 100));
+            .all(|message| message.text.chars().count() <= MAX_SLACK_TEXT_CHARS + 100));
+        let ids: usize = messages.iter().map(|message| message.job_ids.len()).sum();
+        assert_eq!(ids, 100);
+    }
+
+    #[test]
+    fn parses_squeue_states_and_skips_array_ranges() {
+        let jobs = parse_squeue_output("300_1|RUNNING\n300_[2-3]|PENDING\n400|COMPLETING\n500\n");
+        assert_eq!(jobs.len(), 3);
+        assert_eq!(jobs["300_1"], "RUNNING");
+        assert_eq!(jobs["400"], "COMPLETING");
+        assert_eq!(jobs["500"], "");
+    }
+
+    #[test]
+    fn running_like_excludes_completing_and_unknown() {
+        assert!(is_running_like("PENDING"));
+        assert!(is_running_like("RUNNING"));
+        assert!(is_running_like("REQUEUED"));
+        assert!(!is_running_like("COMPLETING"));
+        assert!(!is_running_like("COMPLETED"));
+        assert!(!is_running_like(""));
+    }
+
+    #[test]
+    fn prune_expires_unfinished_jobs_slurm_no_longer_reports() {
+        let now = 100 * 24 * 60 * 60;
+        let record = |id: &str, terminal: bool, notified: bool, age_days: u64| JobRecord {
+            id: id.to_string(),
+            terminal,
+            notified,
+            last_seen: now - age_days * 24 * 60 * 60,
+            ..JobRecord::default()
+        };
+        let mut state = MonitorState::default();
+        for job in [
+            record("1", false, false, 8),
+            record("2", false, false, 1),
+            record("3", true, false, 95),
+            record("4", true, true, 95),
+            record("5_[1-3]", false, false, 0),
+        ] {
+            state.jobs.insert(job.id.clone(), job);
+        }
+        let expired = state.prune(now);
+        assert_eq!(expired, vec!["1".to_string()]);
+        let kept: Vec<&str> = state.jobs.keys().map(String::as_str).collect();
+        assert_eq!(kept, vec!["2", "3"]);
+    }
+
+    #[test]
+    fn groups_array_tasks_into_one_entry() {
+        let job = |id: &str, state: &str, exit: &str| JobRecord {
+            id: id.to_string(),
+            name: "relax".to_string(),
+            state: state.to_string(),
+            exit_code: exit.to_string(),
+            partition: "amd".to_string(),
+            terminal: true,
+            ..JobRecord::default()
+        };
+        let jobs = vec![
+            job("300_0", "COMPLETED", "0:0"),
+            job("300_1", "FAILED", "1:0"),
+            job("300_2", "COMPLETED", "0:0"),
+            job("301_0", "COMPLETED", "0:0"),
+            job("400", "COMPLETED", "0:0"),
+        ];
+        let batches = build_slack_messages("zeyu", &jobs);
+        assert_eq!(batches.len(), 1);
+        let text = &batches[0].text;
+        assert!(text.contains("*Array 300*"));
+        assert!(text.contains("COMPLETED ×2, FAILED ×1"));
+        assert!(text.contains("`300_1` FAILED"));
+        assert!(!text.contains("`300_0` COMPLETED"));
+        // A single finished task is shown like a normal job.
+        assert!(text.contains("*Job 301_0*"));
+        assert!(text.contains("*Job 400*"));
+        assert_eq!(batches[0].job_ids.len(), 5);
+    }
+
+    #[test]
+    fn reads_pid_files_with_and_without_host() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = env::temp_dir().join(format!("slurm-notify-pid-{}-{unique}", std::process::id()));
+        fs::write(&path, "42\n").unwrap();
+        let old = read_pid(&path).unwrap().unwrap();
+        assert_eq!(old.pid, 42);
+        assert!(old.host.is_none());
+        fs::write(&path, "42\nlogin02\n60\n").unwrap();
+        let new = read_pid(&path).unwrap().unwrap();
+        assert_eq!(new.host.as_deref(), Some("login02"));
+        assert_eq!(new.interval_secs, Some(60));
+        let _ = fs::remove_file(path);
     }
 
     #[test]
