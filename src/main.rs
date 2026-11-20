@@ -1,6 +1,8 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, OpenOptions};
+use std::hash::{Hash, Hasher};
 use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -28,11 +30,14 @@ const MAX_SLACK_TEXT_CHARS: usize = 3500;
 const LOG_RETENTION_SECS: u64 = 3 * 24 * 60 * 60;
 const LOG_PRUNE_INTERVAL_SECS: u64 = 60 * 60;
 const FINISHED_RETENTION_SECS: u64 = 90 * 24 * 60 * 60;
+const DEFAULT_IDLE_INTERVAL_SECS: u64 = 120;
+const DEFAULT_ACCOUNTING_INTERVAL_SECS: u64 = 120;
+const ACTIVE_LAST_SEEN_REFRESH_SECS: u64 = 10 * 60;
 /// Unfinished jobs that neither squeue nor sacct has reported for this long
 /// are dropped so that they are not queried forever.
 const UNFINISHED_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
-/// Extra time, on top of three poll intervals, before a monitor on another
-/// login node is considered gone because the shared state file stopped changing.
+/// Extra time, on top of three stored polling intervals, before a monitor on
+/// another login node is considered gone because its shared heartbeat stopped.
 const HEARTBEAT_GRACE_SECS: u64 = 180;
 const MAX_LISTED_ARRAY_PROBLEMS: usize = 10;
 
@@ -40,6 +45,8 @@ const MAX_LISTED_ARRAY_PROBLEMS: usize = 10;
 struct Config {
     user: String,
     interval_secs: u64,
+    idle_interval_secs: u64,
+    accounting_interval_secs: u64,
     lookback_hours: u64,
     state_file: PathBuf,
     pid_file: PathBuf,
@@ -68,6 +75,8 @@ impl Config {
         Ok(Self {
             user,
             interval_secs: 30,
+            idle_interval_secs: DEFAULT_IDLE_INTERVAL_SECS,
+            accounting_interval_secs: DEFAULT_ACCOUNTING_INTERVAL_SECS,
             lookback_hours: 6,
             state_file: data_dir.join("state.tsv"),
             pid_file: data_dir.join("monitor.pid"),
@@ -78,7 +87,7 @@ impl Config {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Hash, PartialEq, Eq)]
 struct JobRecord {
     id: String,
     name: String,
@@ -99,31 +108,35 @@ impl JobRecord {
         if fields.len() != 8 || fields[0].trim().is_empty() {
             return None;
         }
-        let state = clean(&fields[1]);
+        let state = clean(fields[1]);
         Some(Self {
-            id: clean(&fields[0]),
-            name: clean(&fields[7]),
+            id: clean(fields[0]),
+            name: clean(fields[7]),
             terminal: is_terminal(&state),
             state,
-            exit_code: clean(&fields[2]),
-            elapsed: clean(&fields[3]),
-            end: clean(&fields[4]),
-            partition: clean(&fields[5]),
-            node_list: clean(&fields[6]),
+            exit_code: clean(fields[2]),
+            elapsed: clean(fields[3]),
+            end: clean(fields[4]),
+            partition: clean(fields[5]),
+            node_list: clean(fields[6]),
             notified: false,
             last_seen: now,
         })
     }
 
     fn mark_running(&mut self, now: u64) {
-        self.last_seen = now;
-        if !self.terminal {
+        if self.last_seen == 0
+            || now.saturating_sub(self.last_seen) >= ACTIVE_LAST_SEEN_REFRESH_SECS
+        {
+            self.last_seen = now;
+        }
+        if !self.terminal && self.state != "RUNNING_OR_PENDING" {
             self.state = "RUNNING_OR_PENDING".to_string();
         }
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Hash)]
 struct MonitorState {
     initialized: bool,
     jobs: BTreeMap<String, JobRecord>,
@@ -244,6 +257,12 @@ impl MonitorState {
         })
     }
 
+    fn fingerprint(&self) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        self.hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Removes old records and returns the IDs of unfinished jobs that were
     /// dropped because Slurm stopped reporting them.
     fn prune(&mut self, now: u64) -> Vec<String> {
@@ -321,6 +340,16 @@ fn parse_config(args: Vec<String>) -> Result<Config, String> {
                 config.interval_secs = parse_positive(value(1)?, "--interval")?;
                 index += 2;
             }
+            "--idle-interval" => {
+                config.idle_interval_secs =
+                    parse_positive(value(1)?, "--idle-interval")?;
+                index += 2;
+            }
+            "--accounting-interval" => {
+                config.accounting_interval_secs =
+                    parse_positive(value(1)?, "--accounting-interval")?;
+                index += 2;
+            }
             "--lookback-hours" => {
                 config.lookback_hours = parse_positive(value(1)?, "--lookback-hours")?;
                 index += 2;
@@ -368,6 +397,14 @@ fn parse_positive(value: &str, name: &str) -> Result<u64, String> {
     Ok(parsed)
 }
 
+fn state_heartbeat_interval(config: &Config) -> u64 {
+    config
+        .interval_secs
+        .max(config.idle_interval_secs)
+        .saturating_mul(2)
+        .max(60)
+}
+
 fn monitor(config: &Config, once: bool) -> Result<(), String> {
     let webhook = if config.dry_run {
         None
@@ -377,15 +414,36 @@ fn monitor(config: &Config, once: bool) -> Result<(), String> {
     let mut state = MonitorState::load(&config.state_file)?;
     let first_run = !state.initialized;
     log(&format!(
-        "monitor starting: user={}, interval={}s, lookback={}h, first_run={}, dry_run={}",
-        config.user, config.interval_secs, config.lookback_hours, first_run, config.dry_run
+        "monitor starting: user={}, active_interval={}s, idle_interval={}s, \
+         accounting_interval={}s, lookback={}h, first_run={}, dry_run={}",
+        config.user,
+        config.interval_secs,
+        config.idle_interval_secs,
+        config.accounting_interval_secs,
+        config.lookback_hours,
+        first_run,
+        config.dry_run
     ));
 
     if first_run {
         establish_baseline(config, &mut state)?;
     }
 
-    let mut next_log_prune = unix_now();
+    let started_at = unix_now();
+    // The accounting table is expensive to scan. Known completions are still
+    // resolved immediately by job ID when they disappear from squeue; the
+    // periodic full scan is only needed to discover very short jobs.
+    let mut next_accounting = if first_run {
+        started_at.saturating_add(config.accounting_interval_secs)
+    } else {
+        started_at
+    };
+    let mut next_heartbeat = if first_run {
+        started_at.saturating_add(state_heartbeat_interval(config))
+    } else {
+        started_at
+    };
+    let mut next_log_prune = started_at;
     loop {
         let now = unix_now();
         if !once && now >= next_log_prune {
@@ -399,13 +457,33 @@ fn monitor(config: &Config, once: bool) -> Result<(), String> {
             }
             next_log_prune = now.saturating_add(LOG_PRUNE_INTERVAL_SECS);
         }
-        if let Err(error) = poll_once(config, &mut state, webhook.as_deref()) {
+        let full_accounting = once || now >= next_accounting;
+        let heartbeat_due = once || now >= next_heartbeat;
+        let (stats, result) = poll_once(
+            config,
+            &mut state,
+            webhook.as_deref(),
+            full_accounting,
+            heartbeat_due,
+        );
+        if let Err(ref error) = result {
             log(&format!("poll failed: {error}"));
         }
         if once {
             return Ok(());
         }
-        thread::sleep(Duration::from_secs(config.interval_secs));
+        if full_accounting {
+            next_accounting = now.saturating_add(config.accounting_interval_secs);
+        }
+        if heartbeat_due {
+            next_heartbeat = now.saturating_add(state_heartbeat_interval(config));
+        }
+        let delay = if stats.active_jobs > 0 || result.is_err() {
+            config.interval_secs
+        } else {
+            config.idle_interval_secs
+        };
+        thread::sleep(Duration::from_secs(delay));
     }
 }
 
@@ -446,9 +524,21 @@ fn establish_baseline(config: &Config, state: &mut MonitorState) -> Result<(), S
     Ok(())
 }
 
-fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -> Result<(), String> {
+#[derive(Debug, Default)]
+struct PollStats {
+    active_jobs: usize,
+}
+
+fn poll_once(
+    config: &Config,
+    state: &mut MonitorState,
+    webhook: Option<&str>,
+    full_accounting: bool,
+    heartbeat_due: bool,
+) -> (PollStats, Result<(), String>) {
     let now = unix_now();
     let mut errors = Vec::new();
+    let state_before = state.fingerprint();
 
     // Job ID -> squeue state. When squeue fails, fall back to the jobs that
     // were unfinished last time, with an unknown state.
@@ -481,13 +571,15 @@ fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -
     }
 
     let mut accounting_records = BTreeMap::<String, JobRecord>::new();
-    match sacct_recent(config) {
-        Ok(records) => {
-            for record in records {
-                accounting_records.insert(record.id.clone(), record);
+    if full_accounting {
+        match sacct_recent(config) {
+            Ok(records) => {
+                for record in records {
+                    accounting_records.insert(record.id.clone(), record);
+                }
             }
+            Err(error) => errors.push(format!("sacct recent: {error}")),
         }
-        Err(error) => errors.push(format!("sacct recent: {error}")),
     }
 
     let vanished: Vec<String> = state
@@ -520,7 +612,6 @@ fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -
             }
             match state.jobs.get_mut(&record.id) {
                 Some(existing) if existing.notified => {
-                    existing.last_seen = now;
                     if existing.name.is_empty() {
                         existing.name = record.name;
                     }
@@ -538,7 +629,11 @@ fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -
     }
 
     log_expired(&state.prune(now));
-    state.save(&config.state_file)?;
+    if heartbeat_due || state.fingerprint() != state_before {
+        if let Err(error) = state.save(&config.state_file) {
+            errors.push(format!("state: {error}"));
+        }
+    }
 
     // Array tasks are reported together once every task of the array is done.
     let unfinished_arrays: BTreeSet<String> = state
@@ -575,7 +670,9 @@ fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -
                                 saved.notified = true;
                             }
                         }
-                        state.save(&config.state_file)?;
+                        if let Err(error) = state.save(&config.state_file) {
+                            errors.push(format!("state: {error}"));
+                        }
                         log(&format!(
                             "sent Slack notification for {} job(s)",
                             batch.job_ids.len()
@@ -594,20 +691,25 @@ fn poll_once(config: &Config, state: &mut MonitorState, webhook: Option<&str>) -
         }
     }
 
+    let stats = PollStats {
+        active_jobs: active.len(),
+    };
     if errors.is_empty() {
-        let held_note = if held > 0 {
-            format!(", {held} array task(s) waiting for the rest of their array")
-        } else {
-            String::new()
-        };
-        log(&format!(
-            "poll complete: {} active, {} awaiting notification{held_note}",
-            active.len(),
-            pending.len()
-        ));
-        Ok(())
+        if full_accounting {
+            let held_note = if held > 0 {
+                format!(", {held} array task(s) waiting for the rest of their array")
+            } else {
+                String::new()
+            };
+            log(&format!(
+                "reconciliation complete: {} active, {} awaiting notification{held_note}",
+                active.len(),
+                pending.len()
+            ));
+        }
+        (stats, Ok(()))
     } else {
-        Err(errors.join("; "))
+        (stats, Err(errors.join("; ")))
     }
 }
 
@@ -865,6 +967,69 @@ struct SlackBatch {
     job_ids: Vec<String>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum MessageLanguage {
+    English,
+    Korean,
+}
+
+struct MessageLabels {
+    job: &'static str,
+    array: &'static str,
+    status: &'static str,
+    exit_code: &'static str,
+    elapsed: &'static str,
+    partition: &'static str,
+    nodes: &'static str,
+    end_time: &'static str,
+    tasks: &'static str,
+    unfinished_tasks: &'static str,
+    more: &'static str,
+    last_end_time: &'static str,
+    unknown: &'static str,
+}
+
+fn message_labels(language: MessageLanguage) -> MessageLabels {
+    match language {
+        MessageLanguage::English => MessageLabels {
+            job: "Job",
+            array: "Array",
+            status: "Status",
+            exit_code: "Exit code",
+            elapsed: "Elapsed time",
+            partition: "Partition",
+            nodes: "Nodes",
+            end_time: "End time",
+            tasks: "Tasks",
+            unfinished_tasks: "Tasks that did not complete",
+            more: "and {} more",
+            last_end_time: "Last end time",
+            unknown: "(unknown)",
+        },
+        MessageLanguage::Korean => MessageLabels {
+            job: "작업",
+            array: "배열",
+            status: "상태",
+            exit_code: "종료 코드",
+            elapsed: "실행 시간",
+            partition: "파티션",
+            nodes: "노드",
+            end_time: "종료 시간",
+            tasks: "작업 수",
+            unfinished_tasks: "완료되지 않은 작업",
+            more: "…외 {}개",
+            last_end_time: "마지막 종료 시간",
+            unknown: "(알 수 없음)",
+        },
+    }
+}
+
+struct SlackEntry {
+    english: String,
+    korean: String,
+    job_ids: Vec<String>,
+}
+
 fn build_slack_messages(user: &str, jobs: &[JobRecord]) -> Vec<SlackBatch> {
     let mut arrays: BTreeMap<&str, Vec<&JobRecord>> = BTreeMap::new();
     for job in jobs {
@@ -873,56 +1038,90 @@ fn build_slack_messages(user: &str, jobs: &[JobRecord]) -> Vec<SlackBatch> {
         }
     }
 
-    let mut entries: Vec<(String, Vec<String>)> = Vec::new();
+    let mut entries: Vec<SlackEntry> = Vec::new();
     let mut emitted = BTreeSet::new();
     for job in jobs {
         match array_parent(&job.id) {
             Some(parent) if arrays[parent].len() > 1 => {
                 if emitted.insert(parent) {
                     let tasks = &arrays[parent];
-                    entries.push((
-                        format_array(parent, tasks),
-                        tasks.iter().map(|task| task.id.clone()).collect(),
-                    ));
+                    entries.push(SlackEntry {
+                        english: format_array(
+                            parent,
+                            tasks,
+                            MessageLanguage::English,
+                        ),
+                        korean: format_array(
+                            parent,
+                            tasks,
+                            MessageLanguage::Korean,
+                        ),
+                        job_ids: tasks.iter().map(|task| task.id.clone()).collect(),
+                    });
                 }
             }
-            _ => entries.push((format_job(job), vec![job.id.clone()])),
+            _ => entries.push(SlackEntry {
+                english: format_job(job, MessageLanguage::English),
+                korean: format_job(job, MessageLanguage::Korean),
+                job_ids: vec![job.id.clone()],
+            }),
         }
     }
 
     let mut batches = Vec::new();
-    let mut body = String::new();
+    let mut english_body = String::new();
+    let mut korean_body = String::new();
     let mut job_ids = Vec::new();
-    for (entry, entry_ids) in entries {
-        if !body.is_empty()
-            && body.chars().count() + entry.chars().count() + 80 > MAX_SLACK_TEXT_CHARS
-        {
+    let empty_message_len = slack_message(user, "", "").chars().count();
+    let mut batch_char_count = empty_message_len;
+    for entry in entries {
+        let mut separator_len = if english_body.is_empty() { 0 } else { 4 };
+        let candidate_len = batch_char_count
+            + separator_len
+            + entry.english.chars().count()
+            + entry.korean.chars().count();
+        if !english_body.is_empty() && candidate_len > MAX_SLACK_TEXT_CHARS {
             batches.push(SlackBatch {
-                text: slack_message(user, &body),
+                text: slack_message(user, &english_body, &korean_body),
                 job_ids: std::mem::take(&mut job_ids),
             });
-            body.clear();
+            english_body.clear();
+            korean_body.clear();
+            batch_char_count = empty_message_len;
+            separator_len = 0;
         }
-        if !body.is_empty() {
-            body.push_str("\n\n");
+        if !english_body.is_empty() {
+            english_body.push_str("\n\n");
+            korean_body.push_str("\n\n");
         }
-        body.push_str(&entry);
-        job_ids.extend(entry_ids);
+        english_body.push_str(&entry.english);
+        korean_body.push_str(&entry.korean);
+        batch_char_count = batch_char_count
+            + separator_len
+            + entry.english.chars().count()
+            + entry.korean.chars().count();
+        job_ids.extend(entry.job_ids);
     }
-    if !body.is_empty() {
+    if !english_body.is_empty() {
         batches.push(SlackBatch {
-            text: slack_message(user, &body),
+            text: slack_message(user, &english_body, &korean_body),
             job_ids,
         });
     }
     batches
 }
 
-fn slack_message(user: &str, body: &str) -> String {
-    format!(":bell: *SLURM 任务结束通知*\n用户: `{}`\n\n{}", user, body)
+fn slack_message(user: &str, english_body: &str, korean_body: &str) -> String {
+    format!(
+        ":bell: *SLURM job finished* / *SLURM 작업 완료*\n\
+         User / 사용자: `{user}`\n\n\
+         *English*\n{english_body}\n\n\
+         *한국어*\n{korean_body}"
+    )
 }
 
-fn format_job(job: &JobRecord) -> String {
+fn format_job(job: &JobRecord, language: MessageLanguage) -> String {
+    let labels = message_labels(language);
     let icon = if job.state.starts_with("COMPLETED") {
         ":white_check_mark:"
     } else if job.state.starts_with("CANCELLED") {
@@ -931,43 +1130,48 @@ fn format_job(job: &JobRecord) -> String {
         ":x:"
     };
     let name = if job.name.is_empty() {
-        "(unknown)".to_string()
+        labels.unknown.to_string()
     } else {
         job.name.replace('`', "'")
     };
     let mut lines = vec![format!(
-        "{icon} *Job {}* `{}`",
-        job.id, name
+        "{icon} *{} {}* `{}`",
+        labels.job, job.id, name
     )];
-    lines.push(format!("状态: *{}*", job.state));
+    lines.push(format!("{}: *{}*", labels.status, job.state));
     if !job.exit_code.is_empty() {
-        lines.push(format!("退出码: `{}`", job.exit_code));
+        lines.push(format!("{}: `{}`", labels.exit_code, job.exit_code));
     }
     if !job.elapsed.is_empty() {
-        lines.push(format!("运行时间: `{}`", job.elapsed));
+        lines.push(format!("{}: `{}`", labels.elapsed, job.elapsed));
     }
     if !job.partition.is_empty() {
-        lines.push(format!("分区: `{}`", job.partition));
+        lines.push(format!("{}: `{}`", labels.partition, job.partition));
     }
     if !job.node_list.is_empty() {
-        lines.push(format!("节点: `{}`", job.node_list));
+        lines.push(format!("{}: `{}`", labels.nodes, job.node_list));
     }
     if !job.end.is_empty() {
-        lines.push(format!("结束时间: `{}`", job.end));
+        lines.push(format!("{}: `{}`", labels.end_time, job.end));
     }
     lines.join("\n")
 }
 
-fn format_array(parent: &str, tasks: &[&JobRecord]) -> String {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+fn format_array(
+    parent: &str,
+    tasks: &[&JobRecord],
+    language: MessageLanguage,
+) -> String {
+    let labels = message_labels(language);
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
     for task in tasks {
         *counts.entry(base_state(&task.state)).or_default() += 1;
     }
-    let icon = if counts.keys().all(|state| state == "COMPLETED") {
+    let icon = if counts.keys().all(|state| *state == "COMPLETED") {
         ":white_check_mark:"
     } else if counts
         .keys()
-        .all(|state| state == "COMPLETED" || state == "CANCELLED")
+        .all(|state| *state == "COMPLETED" || *state == "CANCELLED")
     {
         ":warning:"
     } else {
@@ -977,7 +1181,7 @@ fn format_array(parent: &str, tasks: &[&JobRecord]) -> String {
         .iter()
         .find(|task| !task.name.is_empty())
         .map(|task| task.name.replace('`', "'"))
-        .unwrap_or_else(|| "(unknown)".to_string());
+        .unwrap_or_else(|| labels.unknown.to_string());
     let summary = counts
         .iter()
         .map(|(state, count)| format!("{state} ×{count}"))
@@ -985,9 +1189,9 @@ fn format_array(parent: &str, tasks: &[&JobRecord]) -> String {
         .join(", ");
 
     let mut lines = vec![
-        format!("{icon} *Array {parent}* `{name}`"),
-        format!("任务数: `{}`", tasks.len()),
-        format!("状态: *{summary}*"),
+        format!("{icon} *{} {parent}* `{name}`", labels.array),
+        format!("{}: `{}`", labels.tasks, tasks.len()),
+        format!("{}: *{summary}*", labels.status),
     ];
 
     let problems: Vec<&&JobRecord> = tasks
@@ -995,19 +1199,22 @@ fn format_array(parent: &str, tasks: &[&JobRecord]) -> String {
         .filter(|task| base_state(&task.state) != "COMPLETED")
         .collect();
     if !problems.is_empty() {
-        lines.push("未成功的任务:".to_string());
+        lines.push(format!("{}:", labels.unfinished_tasks));
         for task in problems.iter().take(MAX_LISTED_ARRAY_PROBLEMS) {
             let exit = if task.exit_code.is_empty() {
                 String::new()
             } else {
-                format!(" 退出码 `{}`", task.exit_code)
+                format!(" {} `{}`", labels.exit_code, task.exit_code)
             };
             lines.push(format!("• `{}` {}{exit}", task.id, task.state));
         }
         if problems.len() > MAX_LISTED_ARRAY_PROBLEMS {
             lines.push(format!(
-                "• …另有 {} 个",
-                problems.len() - MAX_LISTED_ARRAY_PROBLEMS
+                "• {}",
+                labels.more.replace(
+                    "{}",
+                    &(problems.len() - MAX_LISTED_ARRAY_PROBLEMS).to_string()
+                )
             ));
         }
     }
@@ -1018,7 +1225,11 @@ fn format_array(parent: &str, tasks: &[&JobRecord]) -> String {
         .filter(|partition| !partition.is_empty())
         .collect();
     if partitions.len() == 1 {
-        lines.push(format!("分区: `{}`", partitions.iter().next().unwrap()));
+        lines.push(format!(
+            "{}: `{}`",
+            labels.partition,
+            partitions.iter().next().unwrap()
+        ));
     }
     if let Some(end) = tasks
         .iter()
@@ -1026,7 +1237,7 @@ fn format_array(parent: &str, tasks: &[&JobRecord]) -> String {
         .filter(|end| !end.is_empty() && *end != "Unknown")
         .max()
     {
-        lines.push(format!("最后结束时间: `{end}`"));
+        lines.push(format!("{}: `{end}`", labels.last_end_time));
     }
     lines.join("\n")
 }
@@ -1050,8 +1261,11 @@ fn json_escape(value: &str) -> String {
 fn test_slack(config: &Config) -> Result<(), String> {
     let webhook = load_webhook(&config.env_file)?;
     let message = format!(
-        ":wave: SLURM 通知测试成功\n用户: `{}`\n监控器已经可以连接 Slack。",
-        config.user
+        ":wave: *SLURM notification test successful* / *SLURM 알림 테스트 성공*\n\
+         User / 사용자: `{}`\n\n\
+         *English*\nThe monitor can connect to Slack.\n\n\
+         *한국어*\n모니터가 Slack에 연결할 수 있습니다.",
+        config.user,
     );
     send_slack(&webhook, &message)?;
     println!("Slack test message sent.");
@@ -1132,7 +1346,7 @@ fn start(config: &Config) -> Result<(), String> {
         "{}\n{}\n{}\n",
         child.id(),
         current_hostname(),
-        config.interval_secs
+        config.interval_secs.max(config.idle_interval_secs)
     );
     if let Err(error) = fs::write(&config.pid_file, pid_content) {
         let _ = Command::new("kill")
@@ -1221,6 +1435,10 @@ fn config_to_args(config: &Config) -> Vec<String> {
         config.user.clone(),
         "--interval".to_string(),
         config.interval_secs.to_string(),
+        "--idle-interval".to_string(),
+        config.idle_interval_secs.to_string(),
+        "--accounting-interval".to_string(),
+        config.accounting_interval_secs.to_string(),
         "--lookback-hours".to_string(),
         config.lookback_hours.to_string(),
         "--state-file".to_string(),
@@ -1248,8 +1466,8 @@ enum MonitorLocation {
     NotRunning,
     Local(u32),
     /// Started on another login node that shares this home directory. The
-    /// process cannot be checked from here, so the state file, which the
-    /// monitor rewrites on every poll, serves as its heartbeat.
+    /// process cannot be checked from here, so the state file's modification
+    /// time serves as a low-frequency heartbeat.
     Remote {
         pid: u32,
         host: String,
@@ -1409,17 +1627,16 @@ fn clean(value: &str) -> String {
 }
 
 /// `CANCELLED by 1000` -> `CANCELLED`, `COMPLETED+` -> `COMPLETED`.
-fn base_state(state: &str) -> String {
+fn base_state(state: &str) -> &str {
     state
         .split_whitespace()
         .next()
         .unwrap_or("")
         .trim_end_matches('+')
-        .to_string()
 }
 
 fn is_terminal(state: &str) -> bool {
-    TERMINAL_STATES.contains(&base_state(state).as_str())
+    TERMINAL_STATES.contains(&base_state(state))
 }
 
 /// True when squeue reports the job as waiting or running (as opposed to
@@ -1428,8 +1645,8 @@ fn is_terminal(state: &str) -> bool {
 fn is_running_like(squeue_state: &str) -> bool {
     let state = base_state(squeue_state);
     !state.is_empty()
-        && !is_terminal(&state)
-        && !matches!(state.as_str(), "COMPLETING" | "STAGE_OUT" | "SIGNALING")
+        && !is_terminal(state)
+        && !matches!(state, "COMPLETING" | "STAGE_OUT" | "SIGNALING")
 }
 
 /// `123_4` -> `123`. Only array tasks contain an underscore.
@@ -1524,7 +1741,10 @@ Usage:
 
 Options:
   --user USER               Slurm user to monitor (default: current user)
-  --interval SECONDS        Poll interval (default: 30)
+  --interval SECONDS        Active poll interval (default: 30)
+  --idle-interval SECONDS   Poll interval when no jobs are active (default: 120)
+  --accounting-interval SECONDS
+                            Full sacct reconciliation interval (default: 120)
   --lookback-hours HOURS    sacct history window (default: 6)
   --state-file PATH         State file for deduplication
   --pid-file PATH           Background process PID file
@@ -1595,7 +1815,7 @@ mod tests {
         assert!(messages.len() > 1);
         assert!(messages
             .iter()
-            .all(|message| message.text.chars().count() <= MAX_SLACK_TEXT_CHARS + 100));
+            .all(|message| message.text.chars().count() <= MAX_SLACK_TEXT_CHARS));
         let ids: usize = messages.iter().map(|message| message.job_ids.len()).sum();
         assert_eq!(ids, 100);
     }
@@ -1617,6 +1837,20 @@ mod tests {
         assert!(!is_running_like("COMPLETING"));
         assert!(!is_running_like("COMPLETED"));
         assert!(!is_running_like(""));
+    }
+
+    #[test]
+    fn refreshes_active_last_seen_only_at_a_low_frequency() {
+        let mut record = JobRecord {
+            state: "RUNNING".to_string(),
+            last_seen: 100,
+            ..JobRecord::default()
+        };
+        record.mark_running(200);
+        assert_eq!(record.last_seen, 100);
+        assert_eq!(record.state, "RUNNING_OR_PENDING");
+        record.mark_running(700);
+        assert_eq!(record.last_seen, 700);
     }
 
     #[test]
@@ -1666,13 +1900,21 @@ mod tests {
         let batches = build_slack_messages("zeyu", &jobs);
         assert_eq!(batches.len(), 1);
         let text = &batches[0].text;
+        assert!(text.contains("*English*"));
+        assert!(text.contains("*한국어*"));
+        assert!(text.contains("*SLURM job finished*"));
+        assert!(text.contains("*SLURM 작업 완료*"));
         assert!(text.contains("*Array 300*"));
+        assert!(text.contains("*배열 300*"));
         assert!(text.contains("COMPLETED ×2, FAILED ×1"));
         assert!(text.contains("`300_1` FAILED"));
         assert!(!text.contains("`300_0` COMPLETED"));
         // A single finished task is shown like a normal job.
         assert!(text.contains("*Job 301_0*"));
+        assert!(text.contains("*작업 301_0*"));
         assert!(text.contains("*Job 400*"));
+        assert!(text.contains("Status: *COMPLETED ×2, FAILED ×1*"));
+        assert!(text.contains("상태: *COMPLETED ×2, FAILED ×1*"));
         assert_eq!(batches[0].job_ids.len(), 5);
     }
 

@@ -13,11 +13,14 @@ notification when they finish.
 - Detects both running jobs and short jobs that finish between polls.
 - Sends success and failure details, including exit code, elapsed time,
   partition, nodes, and end time.
+- Includes complete English and Korean versions in every Slack notification.
 - Reports a job array once, as a single summary, after all of its tasks
   have finished.
 - Reports the final result of requeued jobs (for example after preemption).
 - Deduplicates notifications using a persistent local state file.
 - Retries Slack delivery when a request fails.
+- Scales polling down automatically when no jobs are active, and avoids
+  broad `sacct` scans and state-file writes that are not needed.
 - Can run in the background after the terminal or SSH session closes.
 - Automatically removes monitor log entries older than three days.
 - Has no third-party Rust dependencies.
@@ -77,6 +80,9 @@ Send a test message before starting the monitor:
 ./target/release/slurm-notify test-slack
 ```
 
+Both the test message and real job notifications contain a complete English
+section followed by a Korean section.
+
 Do not commit the real webhook URL. The repository only contains
 `slack.env.example`.
 
@@ -89,7 +95,9 @@ Do not commit the real webhook URL. The repository only contains
 ```
 
 The command starts one detached background process and returns immediately.
-By default it monitors the current user every 30 seconds.
+By default it checks active jobs every 30 seconds. When no jobs are active,
+it checks every two minutes and performs a full `sacct` reconciliation every
+two minutes.
 
 ### Check status
 
@@ -103,9 +111,10 @@ By default it monitors the current user every 30 seconds.
 tail -f ~/.local/state/slurm-notify/monitor.log
 ```
 
-The monitor writes every poll and every delivery attempt to this log instead
-of printing continuously to the terminal. It removes log entries older than
-three days and checks for expired entries once per hour.
+The monitor logs lifecycle events, errors, periodic reconciliations, and every
+delivery attempt instead of printing continuously to the terminal. Routine
+targeted polls stay out of the log. It removes log entries older than three
+days and checks for expired entries once per hour.
 
 ### Stop monitoring
 
@@ -141,7 +150,9 @@ This is useful for running the monitor under `tmux`, supervisor, or a
 | Option | Default | Description |
 | --- | --- | --- |
 | `--user USER` | Current user | Slurm user to monitor |
-| `--interval SECONDS` | `30` | Poll interval |
+| `--interval SECONDS` | `30` | Poll interval while jobs are active |
+| `--idle-interval SECONDS` | `120` | Poll interval while no jobs are active |
+| `--accounting-interval SECONDS` | `120` | Full `sacct` reconciliation interval |
 | `--lookback-hours HOURS` | `6` | `sacct` history window |
 | `--state-file PATH` | `~/.local/state/slurm-notify/state.tsv` | Deduplication state |
 | `--pid-file PATH` | `~/.local/state/slurm-notify/monitor.pid` | Background process PID |
@@ -155,14 +166,24 @@ Example with a 15-second interval:
 ./target/release/slurm-notify start --interval 15
 ```
 
+For an even quieter login-node footprint:
+
+```bash
+./target/release/slurm-notify start \
+  --idle-interval 300 \
+  --accounting-interval 300
+```
+
+This reduces idle polling, at the cost of detecting jobs that start and finish
+between polls only after up to five minutes.
+
 ## How it works
 
 1. `squeue` provides the current set of active job IDs.
-2. `sacct` provides recently completed jobs, including short jobs that were
-   never observed by `squeue`.
-3. Jobs that disappear from `squeue` are queried explicitly by ID so that
-   long-running jobs are detected even after they are no longer in the
-   configured `sacct` lookback window.
+2. When a known job disappears from `squeue`, `sacct` is queried explicitly
+   for that ID, giving prompt completion detection without a broad scan.
+3. A full `sacct` reconciliation runs less frequently to discover short jobs
+   that started and finished between polls. Both intervals are configurable.
 4. Finished job IDs are stored in the state file and are not notified twice.
    Each Slack message is marked as delivered on its own, so a failure part
    way through a batch does not resend the messages that already went out.
@@ -181,6 +202,12 @@ Example with a 15-second interval:
 On first start, jobs completed during the lookback window are treated as a
 baseline and are not sent. Jobs that finish after the monitor starts are
 notified normally.
+
+The monitor sleeps between checks. While idle it performs about one polling
+command per minute with the defaults, and it does not contact Slack unless a
+notification or test message is due. The state file is only rewritten when
+its contents change, plus a low-frequency heartbeat used by status checks on
+other login nodes.
 
 ## Runtime files
 
@@ -210,8 +237,8 @@ node.
 
 The PID file records the host the monitor was started on. When `status`,
 `start`, or `stop` runs on a different login node that shares the same home
-directory, the process cannot be checked directly, so the state file, which
-the monitor rewrites on every poll, is used as a heartbeat:
+directory, the process cannot be checked directly, so the state file's
+modification time is used as a low-frequency heartbeat:
 
 - If the state file changed within three poll intervals plus three minutes,
   the monitor is reported as running on the other host. `start` refuses to
@@ -260,9 +287,10 @@ cargo test --locked
 ```
 
 The test suite covers Slurm output parsing, Slack payload construction,
-notification deduplication, log retention, short jobs, long-running jobs,
-job arrays, requeued jobs, partial Slack failures, monitors on another login
-node, and background start/stop management.
+English and Korean message content, notification deduplication, log
+retention, short jobs, long-running jobs, job arrays, requeued jobs, partial
+Slack failures, monitors on another login node, and background start/stop
+management.
 
 ## License
 
